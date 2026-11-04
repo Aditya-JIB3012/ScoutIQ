@@ -1,13 +1,16 @@
-"""Authentic Real-World Football Dataset for ScoutIQ.
-Contains real footballers across the Premier League, La Liga, Bundesliga, Serie A,
-Ligue 1, and European competitions with real clubs, nationalities, ages, EA FC stats,
-Transfermarkt valuations, and FBref advanced per-90 metrics.
+"""Player data loaders for ScoutIQ.
+
+The app prefers a public EA FC 26 / SofaScore snapshot and retains the bundled
+2024-era records as an offline fallback.
 """
 
 from __future__ import annotations
 import random
 import numpy as np
 import pandas as pd
+from datetime import date
+import re
+import unicodedata
 
 # Seed for reproducibility
 np.random.seed(42)
@@ -326,6 +329,98 @@ def get_all_real_players() -> pd.DataFrame:
     # Deduplicate by player name
     df = df.drop_duplicates(subset=["name"]).reset_index(drop=True)
     return df
+
+
+CURRENT_PLAYERS_URL = "https://raw.githubusercontent.com/m-mahadi/top5-football-dataset/master/data/clean/sofifa_players.csv"
+CURRENT_STATS_URL = "https://raw.githubusercontent.com/m-mahadi/top5-football-dataset/master/data/clean/sofascore_player_seasons.csv"
+
+
+def get_current_players() -> tuple[pd.DataFrame, str]:
+    """Load the latest available top-five-league snapshot and season statistics.
+
+    The upstream repository refreshes periodically. Season data is selected by
+    its newest season key; network or schema failures are handled by the caller.
+    """
+    players = pd.read_csv(CURRENT_PLAYERS_URL, low_memory=False)
+    stats = pd.read_csv(CURRENT_STATS_URL, low_memory=False)
+    required = {"player", "age", "overall_rating", "potential", "positions", "team", "value_eur"}
+    if not required.issubset(players.columns):
+        raise ValueError("The current player snapshot has an unexpected schema.")
+    if not {"season", "player", "team", "minutesPlayed"}.issubset(stats.columns):
+        raise ValueError("The current-season statistics have an unexpected schema.")
+
+    stats["season_key"] = pd.to_numeric(stats["season"], errors="coerce")
+    current_season = stats["season_key"].max()
+    stats = stats[stats["season_key"] == current_season].copy()
+    # Keep each player's overall competition row and avoid duplicate cup rows.
+    if "type" in stats:
+        overall = stats[stats["type"].astype(str).str.lower().eq("overall")]
+        if not overall.empty:
+            stats = overall
+    stats = stats.sort_values("minutesPlayed", ascending=False).drop_duplicates(["player", "team"])
+    stats = stats.set_index(["player", "team"])
+    def surname_key(value: object) -> str:
+        text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        return words[-1] if words else ""
+    stats_by_surname = {
+        (surname_key(stat_name), str(stat_team).strip()): stat_row
+        for (stat_name, stat_team), stat_row in stats.iterrows()
+    }
+
+    def canonical_league(value: object) -> str:
+        raw = "" if pd.isna(value) else str(value).strip()
+        key = re.sub(r"[^a-z0-9]", "", raw.lower())
+        aliases = {
+            "engpremierleague": "Premier League", "esplaliga": "LaLiga",
+            "laliga": "LaLiga", "gerbundesliga": "Bundesliga",
+            "itaseriea": "Serie A", "fraligue1": "Ligue 1",
+        }
+        return aliases.get(key, raw if raw else "Other")
+    records = []
+    for row in players.to_dict("records"):
+        name = str(row.get("player", "")).strip()
+        club = str(row.get("team", "")).strip()
+        if not name or name.lower() == "nan" or not club or club.lower() == "nan":
+            continue
+        s = stats.loc[(name, club)] if (name, club) in stats.index else stats_by_surname.get((surname_key(row.get("surname_key", name)), club))
+        pos = str(row.get("positions", row.get("best_position", "CM"))).replace(" ", ", ")
+        birth_year = pd.to_numeric(row.get("birth_year"), errors="coerce")
+        age = date.today().year - int(birth_year) if pd.notna(birth_year) and birth_year > 1900 else pd.to_numeric(row.get("age"), errors="coerce")
+        value = pd.to_numeric(row.get("value_eur"), errors="coerce")
+        wage = pd.to_numeric(row.get("wage_eur"), errors="coerce")
+        minutes = float(s.get("minutesPlayed", 0) or 0) if s is not None else 0
+        per90 = lambda key: round(float(s.get(key, 0) or 0) * 90 / minutes, 3) if s is not None and minutes > 0 else np.nan
+        d = {
+            "name": name, "club": club,
+            "league": canonical_league(row.get("league", "")),
+            "age": age, "position": pos,
+            "ovr": row.get("overall_rating"), "pot": row.get("potential"),
+            "pace": row.get("pace_diving", row.get("acceleration", 70)),
+            "shooting": row.get("finishing", row.get("shooting_handling", 60)),
+            "passing": row.get("short_passing", row.get("passing_kicking", 65)),
+            "dribbling": row.get("dribbling", row.get("dribbling_reflexes", 65)),
+            "defending": row.get("defensive_awareness", row.get("defending_pace", 60)),
+            "physical": row.get("strength", row.get("physical_positioning", 65)),
+            "market_val_raw": value if pd.notna(value) else np.nan,
+            "wage_raw": wage if pd.notna(wage) else np.nan,
+            "contract_expiry": str(row.get("contract_end", "")),
+            "goals_p90": per90("goals"), "assists_p90": per90("assists"),
+            "xg_p90": per90("expectedGoals"), "xa_p90": per90("expectedAssists"),
+            "key_passes_p90": per90("keyPasses"),
+            "prog_passes_p90": np.nan, "prog_carries_p90": np.nan,
+            "tackles_won_p90": per90("tacklesWon"),
+            "reputation": row.get("international_reputation", 1),
+            "weak_foot": row.get("weak_foot", 3), "skill_moves": row.get("skill_moves", 3),
+            "minutes": minutes, "injury_days": 0,
+        }
+        # Per-90 dataset fields that are unavailable upstream are left for the
+        # cleaner's role-based imputation rather than being fabricated.
+        records.append(d)
+    if not records:
+        raise ValueError("The current player snapshot contained no usable players.")
+    season_label = f"20{int(current_season) // 100:02d}/{int(current_season) % 100:02d}"
+    return pd.DataFrame(records), f"Latest public snapshot · {season_label}"
 
 
 def generate_player_dataset(n_players: int = 1200, use_real_only: bool = False) -> pd.DataFrame:

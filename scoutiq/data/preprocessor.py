@@ -18,6 +18,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 LEAGUE_TIER_MAP = {
     "Premier League": 1.0,
     "La Liga": 0.90,
+    "LaLiga": 0.90,
     "Bundesliga": 0.85,
     "Serie A": 0.85,
     "Ligue 1": 0.75,
@@ -84,8 +85,11 @@ def parse_wage_to_weekly_eur(val: any) -> float:
     return int(num)
 
 
-def parse_contract_years(val: any, reference_year: float = 2025.5) -> float:
+def parse_contract_years(val: any, reference_year: float | None = None) -> float:
     """Calculate remaining contract years relative to reference season."""
+    if reference_year is None:
+        today = datetime.now()
+        reference_year = today.year + (today.month - 1) / 12.0
     if pd.isna(val) or val is None:
         return 2.0  # default assumption
 
